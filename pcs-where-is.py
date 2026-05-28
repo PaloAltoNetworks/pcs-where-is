@@ -4,13 +4,16 @@
 
 import argparse
 import json
+import logging
 import os
 import re
 import signal
 import sys
+import tempfile
 import time
 
 from datetime import datetime, timedelta
+from typing import Optional, List, Dict, Any
 
 import requests
 
@@ -28,14 +31,14 @@ pc_parser = argparse.ArgumentParser(description='Where is this Tenant? Who are i
 pc_parser.add_argument(
     'customer_name',
     type=str,
-    help='*Required* Customer Name, or filename containg a (JSON) array of Customer Names')
+    help='*Required* Customer Name, or filename containing a (JSON) array of Customer Names')
 pc_parser.add_argument(
     '--ca_bundle',
-    default=os.environ.get('CA_BUNDLE', None),
+    default='',
+    #default=os.environ.get('CA_BUNDLE', None),
     type=str,
     help='(Optional) - Custom CA (bundle) file')
-pc_parser.add_argument(
-    '-s', '--stack',
+pc_parser.add_argument(    '-s', '--stack',
     default='',
     type=str,
     help='(Optional) - Limit search to a stack (defined in the config file)')
@@ -58,7 +61,12 @@ pc_parser.add_argument(
     help="(Optional) Sort tenant users by login or name (Default: 'name')")
 args = pc_parser.parse_args()
 
-DEBUG_MODE = args.debug
+# Configure logging
+logging.basicConfig(
+    level=logging.DEBUG if args.debug else logging.INFO,
+    format='%(message)s'
+)
+logger = logging.getLogger(__name__)
 
 ##########################################################################################
 # Helpers.
@@ -70,76 +78,64 @@ def handler(_signum, _frame):
 
 signal.signal(signal.SIGINT, handler)
 
-def output(output_data=''):
-    print(output_data)
-
-##########################################################################################
-# Helpers.
-##########################################################################################
-
-def login(login_url, access_key, secret_key, ca_bundle):
-    action = 'POST'
-    url = '%s/login' % login_url
+def login(login_url: str, access_key: str, secret_key: str, ca_bundle: str) -> Optional[str]:
+    url = f'{login_url}/login'
     headers = {'Content-Type': 'application/json'}
     requ_data = json.dumps({'username': access_key, 'password': secret_key})
-    api_response = requests.request(action, url, headers=headers, data=requ_data, verify=ca_bundle)
+    api_response = requests.post(url, headers=headers, data=requ_data, verify=ca_bundle)
     auth_token = None
     if api_response.ok:
         api_response = json.loads(api_response.content)
         auth_token = api_response.get('token')
     else:
-        output('API (%s) responded with an error\n%s' % (url, api_response.text))
-    if DEBUG_MODE:
-        output(action)
-        output(url)
-        output(requ_data)
-        output(api_response)
-        # output(auth_token)
-        output()
+        logger.error(f'API ({url}) responded with an error\n{api_response.text}')
+    logger.debug('POST')
+    logger.debug(url)
+    logger.debug(requ_data)
+    logger.debug(api_response)
     return auth_token
 
-def execute(action, url, auth_token, ca_bundle=None, requ_data=None):
+def execute(action: str, url: str, auth_token: str, ca_bundle: Optional[str] = None, requ_data: Optional[str] = None) -> Optional[Any]:
     headers = {'Content-Type': 'application/json'}
     headers['x-redlock-auth'] = auth_token
-    api_response = requests.request(action, url, headers=headers, data=requ_data, verify=ca_bundle)
+    method = getattr(requests, action.lower())
+    api_response = method(url, headers=headers, data=requ_data, verify=ca_bundle)
     result = None
     if api_response.status_code in [401, 429, 500, 502, 503, 504]:
-        output('Exceptional API response code %d received from %s. Waiting and then retrying' % (api_response.status_code, url))
-        for _ in range(1, 3):
-            time.sleep(16)
-            api_response = requests.request(action, url, headers=headers, verify=ca_bundle, data=requ_data)
+        logger.info(f'Exceptional API response code {api_response.status_code} received from {url}. Waiting and then retrying')
+        for retry in range(1, 4):
+            delay = 2 ** retry  # Exponential backoff: 2, 4, 8 seconds
+            logger.debug(f'Retry {retry}/3 after {delay} seconds')
+            time.sleep(delay)
+            api_response = method(url, headers=headers, data=requ_data, verify=ca_bundle)
             if api_response.ok:
                 break # retry loop
     if api_response.status_code == 403:
-        output('403 Unauthorized: check that credentials are valid and are authorized to access the API.')
+        logger.error('403 Unauthorized: check that credentials are valid and are authorized to access the API.')
         return result
-    if DEBUG_MODE:
-        output(action)
-        output(url)
-        output(requ_data)
-        output(api_response.status_code)
-        # output(api_response.text)
-        output()
+    logger.debug(action)
+    logger.debug(url)
+    logger.debug(requ_data)
+    logger.debug(api_response.status_code)
     if api_response.ok:
         try:
             result = json.loads(api_response.content)
         except ValueError:
-            output('API (%s) responded with an error\n%s' % (url, api_response.content))
+            logger.error(f'API ({url}) responded with an error\n{api_response.content}')
             sys.exit(1)
     return result
 
-def define_usage(url, auth_token, ca_bundle, tenant, range):
+def define_usage(url: str, auth_token: str, ca_bundle: str, tenant: Dict[str, Any], range: str) -> None:
     usage_query = json.dumps({'customerName': tenant['customerName'], 'timeRange': {'type':'relative','value': {'amount': 1,'unit': range}}})
-    usage = execute('POST', '%s/_support/license/api/v1/usage/time_series' % url, auth_token, ca_bundle, usage_query)
-    if DEBUG_MODE:
-        output(json.dumps(usage, indent=4))
+    usage = execute('POST', f'{url}/_support/license/api/v1/usage/time_series', auth_token, ca_bundle, usage_query)
+    logger.debug(json.dumps(usage, indent=4))
     if usage and 'dataPoints' in usage and len(usage['dataPoints']) > 0:
         current_usage = usage['dataPoints'][-1]
         if 'counts' in current_usage and len(current_usage['counts']) > 0:
             current_usage_count = sum(sum(c.values()) for c in current_usage['counts'].values())
-            output('\tCredit snapshot, end of period (%s):  %s' % (range,current_usage_count))
+            logger.info(f'\tCredit snapshot, end of period ({range}):  {current_usage_count}')
 
-def find_customer(stack_name, tenant_list, customer_name, url, ca_bundle, auth_token):
+def find_customer(stack_name: str, tenant_list: Optional[List[Dict[str, Any]]], customer_name: str, url: str, ca_bundle: str, auth_token: str) -> int:
     count = 0
     if not tenant_list:
         return count
@@ -147,39 +143,39 @@ def find_customer(stack_name, tenant_list, customer_name, url, ca_bundle, auth_t
     for tenant in tenant_list:
         customer_lower = tenant['customerName'].lower()
         prisma_id = str(tenant['prismaId'])
+        tenant_id = ''
+        serial_num = ''
         if tenant['licenseDetails']['marketplaceData'] is not None:
             tenant_id = str(tenant['licenseDetails']['marketplaceData']['tenantId'])
             serial_num = str(tenant['licenseDetails']['marketplaceData']['serialNumber'])
         if customer_name_lower in customer_lower or customer_name_lower in prisma_id or customer_name_lower in tenant_id or customer_name_lower in serial_num:
-            output('%s found on %s as %s' % (customer_name, stack_name, tenant['customerName']))
-            if DEBUG_MODE:
-                output(json.dumps(tenant, indent=4))
-            output('\tCustomer ID:   %s' % tenant['customerId'])
+            logger.info(f"{customer_name} found on {stack_name} as {tenant['customerName']}")
+            logger.debug(json.dumps(tenant, indent=4))
+            logger.info(f"\tCustomer ID:   {tenant['customerId']}")
             if 'marketplaceData' in tenant['licenseDetails'] and tenant['licenseDetails']['marketplaceData']:
                 if 'serialNumber' in tenant['licenseDetails']['marketplaceData']:
-                    output('\tSerial Number: %s' % tenant['licenseDetails']['marketplaceData']['serialNumber'])
+                    logger.info(f"\tSerial Number: {tenant['licenseDetails']['marketplaceData']['serialNumber']}")
                 if 'tenantId' in tenant['licenseDetails']['marketplaceData']:
-                    output('\tTenant ID:     %s' % tenant['licenseDetails']['marketplaceData']['tenantId'])
+                    logger.info(f"\tTenant ID:     {tenant['licenseDetails']['marketplaceData']['tenantId']}")
                 if 'endTs' in tenant['licenseDetails'] and tenant['licenseDetails']['endTs']:
                     end_dt = datetime.fromtimestamp(tenant['licenseDetails']['endTs']/1000.0)
-                    output('\tRenewal Date:  %s' % end_dt)
-            output('\tPrisma ID:     %s' % tenant['prismaId'])
-            output('\tEval:          %s' % tenant['eval'])
-            output('\tActive:        %s' % tenant['active'])
-            output('\tCredits Available:       %s' % tenant['workloads'])
+                    logger.info(f'\tRenewal Date:  {end_dt}')
+            logger.info(f"\tPrisma ID:     {tenant['prismaId']}")
+            logger.info(f"\tEval:          {tenant['eval']}")
+            logger.info(f"\tActive:        {tenant['active']}")
+            logger.info(f"\tCredits Available:       {tenant['workloads']}")
             define_usage(url, auth_token, ca_bundle, tenant, "day")
             define_usage(url, auth_token, ca_bundle, tenant, "month")
             define_usage(url, auth_token, ca_bundle, tenant, "year")
 
-            output()
+            print()
             if args.users:
                 users_query = json.dumps({'customerName': tenant['customerName']})
-                users = execute('POST', '%s/v2/_support/user' % url, auth_token, ca_bundle, users_query)
-                if DEBUG_MODE:
-                    output(json.dumps(users, indent=4))
+                users = execute('POST', f'{url}/v2/_support/user', auth_token, ca_bundle, users_query)
+                logger.debug(json.dumps(users, indent=4))
                 if users:
-                    output('%-*s\t\t%-*s\t\t%s' % (25, 'Name', 33, 'Email Address', 'Last Login'))
-                    output('%-*s\t\t%-*s\t\t%s' % (25, '----', 33, '-------------', '----------'))
+                    logger.info(f"{'Name':<25}\t\t{'Email Address':<33}\t\tLast Login")
+                    logger.info(f"{'----':<25}\t\t{'-------------':<33}\t\t----------")
                     if args.sort == 'login':
                         users = sorted(users, key=lambda u: u['lastLoginTs'], reverse=True)
                     for user in users:
@@ -189,10 +185,10 @@ def find_customer(stack_name, tenant_list, customer_name, url, ca_bundle, auth_t
                             last_login = 'Never'
                         else:
                             arrow_time = arrow.Arrow.fromtimestamp(user['lastLoginTs']/1000, time_zone)
-                            last_login = '%s - %s' % (arrow_time.format('YYYY-MM-DD'), arrow_time.humanize())
-                        output('%-*s\t\t%-*s\t\t%s' % (25, user['displayName'], 33, user['email'], last_login))
+                            last_login = f"{arrow_time.format('YYYY-MM-DD')} - {arrow_time.humanize()}"
+                        logger.info(f"{user['displayName']:<25}\t\t{user['email']:<33}\t\t{last_login}")
             count += 1
-    output()
+    print()
     return count
 
 ##########################################################################################
@@ -204,7 +200,7 @@ try:
     # pylint: disable=wildcard-import
     from config import *
 except ImportError:
-    output('Error reading configuration file: verify config.py exists in the same directory as this script.')
+    logger.info('Error reading configuration file: verify config.py exists in the same directory as this script.')
     sys.exit(1)
 
 configured = False
@@ -213,7 +209,7 @@ for stack in CONFIG['STACKS']:
         configured = True
         break
 if not configured:
-    output('Error reading configuration file: verify credentials for at least one stack.')
+    logger.info('Error reading configuration file: verify credentials for at least one stack.')
     sys.exit(1)
 
 if args.stack:
@@ -224,7 +220,7 @@ if args.stack:
                 configured = True
                 break
     if not configured:
-        output('Error reading configuration file: verify credentials for the specified stack.')
+        logger.info('Error reading configuration file: verify credentials for the specified stack.')
         sys.exit(1)
 
 if args.ca_bundle:
@@ -242,33 +238,30 @@ for customer in CONFIG['CUSTOMERS']:
         if args.stack and args.stack.lower() != stack.lower():
             continue
         if CONFIG['STACKS'][stack]['access_key']:
-            output('Checking: %s' % stack)
-            output()
+            logger.info(f'Checking: {stack}')
+            print()
             token = login(CONFIG['STACKS'][stack]['url'], CONFIG['STACKS'][stack]['access_key'], CONFIG['STACKS'][stack]['secret_key'], CONFIG['CA_BUNDLE'])
             if not token:
-                output('Skipping %s because of authentication failure.' % stack)
-                output()
+                logger.info(f'Skipping {stack} because of authentication failure.')
+                print()
                 continue
-            customers_file_name = '/tmp/%s-customers.json' % re.sub(r'\W+', '', stack).lower()
+            customers_file_name = os.path.join(tempfile.gettempdir(), f"{re.sub(r'\W+', '', stack).lower()}-customers.json")
             if os.path.isfile(customers_file_name):
                 hours_ago = datetime.now() - timedelta(hours=8)
                 customers_file_date = datetime.fromtimestamp(os.path.getctime(customers_file_name))
                 if customers_file_date < hours_ago or args.cache is False:
-                    if DEBUG_MODE:
-                        output('Deleting cached stack file: %s' % customers_file_name)
+                    logger.debug(f'Deleting cached stack file: {customers_file_name}')
                     os.remove(customers_file_name)
             if os.path.isfile(customers_file_name):
                 with open(customers_file_name, 'r', encoding='utf8') as f:
-                    if DEBUG_MODE:
-                        output('Reading cached stack file: %s' % customers_file_name)
+                    logger.debug(f'Reading cached stack file: {customers_file_name}')
                     tenants = json.load(f)
             else:
-                tenants = execute('GET', '%s/_support/customer' % CONFIG['STACKS'][stack]['url'], token, CONFIG['CA_BUNDLE'])
+                tenants = execute('GET', f"{CONFIG['STACKS'][stack]['url']}/_support/customer", token, CONFIG['CA_BUNDLE'])
                 if tenants and args.cache:
-                    result_file = open(customers_file_name, 'w')
-                    result_file.write(json.dumps(tenants))
-                    result_file.close()
+                    with open(customers_file_name, 'w', encoding='utf8') as result_file:
+                        json.dump(tenants, result_file)
             found += find_customer(stack, tenants, customer, CONFIG['STACKS'][stack]['url'], CONFIG['CA_BUNDLE'], token)
     if found == 0:
-        output('%s not found on any configured stack' % customer)
-    output()
+        logger.info(f'{customer} not found on any configured stack')
+    print()
