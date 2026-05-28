@@ -168,7 +168,7 @@ def find_customer(stack_name: str, tenant_list: Optional[List[Dict[str, Any]]], 
             define_usage(url, auth_token, ca_bundle, tenant, "month")
             define_usage(url, auth_token, ca_bundle, tenant, "year")
 
-            logger.info()
+            print()
             if args.users:
                 users_query = json.dumps({'customerName': tenant['customerName']})
                 users = execute('POST', f'{url}/v2/_support/user', auth_token, ca_bundle, users_query)
@@ -188,7 +188,7 @@ def find_customer(stack_name: str, tenant_list: Optional[List[Dict[str, Any]]], 
                             last_login = f"{arrow_time.format('YYYY-MM-DD')} - {arrow_time.humanize()}"
                         logger.info(f"{user['displayName']:<25}\t\t{user['email']:<33}\t\t{last_login}")
             count += 1
-    logger.info()
+    print()
     return count
 
 ##########################################################################################
@@ -239,11 +239,11 @@ for customer in CONFIG['CUSTOMERS']:
             continue
         if CONFIG['STACKS'][stack]['access_key']:
             logger.info(f'Checking: {stack}')
-            logger.info()
+            print()
             token = login(CONFIG['STACKS'][stack]['url'], CONFIG['STACKS'][stack]['access_key'], CONFIG['STACKS'][stack]['secret_key'], CONFIG['CA_BUNDLE'])
             if not token:
                 logger.info(f'Skipping {stack} because of authentication failure.')
-                logger.info()
+                print()
                 continue
             customers_file_name = os.path.join(tempfile.gettempdir(), f"{re.sub(r'\W+', '', stack).lower()}-customers.json")
             if os.path.isfile(customers_file_name):
@@ -264,4 +264,4 @@ for customer in CONFIG['CUSTOMERS']:
             found += find_customer(stack, tenants, customer, CONFIG['STACKS'][stack]['url'], CONFIG['CA_BUNDLE'], token)
     if found == 0:
         logger.info(f'{customer} not found on any configured stack')
-    logger.info()
+    print()
